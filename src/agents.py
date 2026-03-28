@@ -10,6 +10,7 @@ import json
 import pandas as pd
 from langchain_groq import ChatGroq
 from langchain_core.tools import tool
+from langchain_core.messages import SystemMessage
 from langgraph.prebuilt import create_react_agent
 
 from src.predict import predict_batch
@@ -24,14 +25,13 @@ _FEATURE_COLS_PATH = "models/feature_columns.json"
 _df_raw = pd.read_csv(_DATA_PATH)
 _feature_cols = json.load(open(_FEATURE_COLS_PATH))
 
-# Add churn_probability column if not present
+# Add churn_probability column if not already present
 if "churn_probability" not in _df_raw.columns:
     X = _df_raw[_feature_cols]
     _df_raw["churn_probability"] = predict_batch(X)["churn_probability"].values
 
-# Add a stable customer_id column based on DataFrame index
+# Stable integer-based customer_id column
 _df_raw["customer_id"] = _df_raw.index.astype(str)
-
 _df = _df_raw.copy()
 
 
@@ -39,7 +39,10 @@ def _get_customer_row(customer_id: str) -> pd.Series:
     """Return one customer row by integer index (as string)."""
     idx = int(customer_id)
     if idx not in _df.index:
-        raise ValueError(f"Customer ID {customer_id} not found. Valid range: 0 to {len(_df) - 1}.")
+        raise ValueError(
+            f"Customer ID {customer_id} not found. "
+            f"Valid range: 0 to {len(_df) - 1}."
+        )
     return _df.loc[idx]
 
 
@@ -51,7 +54,7 @@ def get_at_risk_customers(threshold: str) -> str:
     """
     Returns customers whose churn probability is at or above the given threshold.
     Input: a float between 0 and 1 as a string, e.g. '0.75'.
-    Returns a summary string with customer IDs and their churn probabilities.
+    Returns a summary with customer IDs and their churn probabilities.
     """
     try:
         thresh = float(threshold.strip())
@@ -109,7 +112,6 @@ def suggest_retention_actions(customer_id: str) -> str:
     Input: customer ID as a string (integer index), e.g. '1976'.
     Returns actionable retention recommendations tailored to that customer.
     """
-    # Action map: feature name fragment → recommendation
     ACTION_MAP = {
         "Contract_One year": "Offer a discount to upgrade from month-to-month to a 1-year contract.",
         "Contract_Two year": "Offer a loyalty incentive to upgrade to a 2-year contract.",
@@ -133,11 +135,8 @@ def suggest_retention_actions(customer_id: str) -> str:
         return str(e)
 
     feature_row = row[_feature_cols]
-
-    # Get SHAP explanation to find top drivers
     explanation = explain_customer(feature_row)
 
-    # Parse top features from explanation string
     actions = []
     for feature_fragment, action in ACTION_MAP.items():
         if feature_fragment.lower() in explanation.lower():
@@ -175,7 +174,9 @@ def churn_summary_stats(_: str) -> str:
     avg_churn_rate = _df["churn_probability"].mean()
 
     high_risk = (_df["churn_probability"] >= 0.75).sum()
-    medium_risk = ((_df["churn_probability"] >= 0.45) & (_df["churn_probability"] < 0.75)).sum()
+    medium_risk = (
+        (_df["churn_probability"] >= 0.45) & (_df["churn_probability"] < 0.75)
+    ).sum()
     low_risk = (_df["churn_probability"] < 0.45).sum()
 
     avg_charges_high = _df[_df["churn_probability"] >= 0.75]["MonthlyCharges"].mean()
@@ -184,27 +185,37 @@ def churn_summary_stats(_: str) -> str:
     return (
         f"ChurnIQ Dataset Summary\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Total customers:          {total:,}\n"
+        f"Total customers:           {total:,}\n"
         f"Average churn probability: {avg_churn_rate:.1%}\n"
         f"\n"
         f"Risk breakdown:\n"
-        f"  High risk  (≥75%):  {high_risk:,} customers\n"
+        f"  High risk   (≥75%):   {high_risk:,} customers\n"
         f"  Medium risk (45–75%): {medium_risk:,} customers\n"
-        f"  Low risk   (<45%):  {low_risk:,} customers\n"
+        f"  Low risk    (<45%):   {low_risk:,} customers\n"
         f"\n"
         f"Avg monthly charges:\n"
-        f"  High-risk customers:   ${avg_charges_high:.2f}\n"
-        f"  Low-risk customers:    ${avg_charges_low:.2f}\n"
+        f"  High-risk customers:  ${avg_charges_high:.2f}\n"
+        f"  Low-risk customers:   ${avg_charges_low:.2f}\n"
     )
 
 
 # ─────────────────────────────────────────────
 # Build the agent
 # ─────────────────────────────────────────────
+_SYSTEM_PROMPT = (
+    "You are ChurnIQ, a SaaS revenue intelligence analyst. "
+    "You have access to a trained XGBoost churn prediction model and live customer data. "
+    "Always use your tools to ground answers in real data before responding. "
+    "Be specific, concise, and actionable. "
+    "When citing churn probabilities, express them as percentages. "
+    "Never guess — if you need data, call the appropriate tool."
+)
+
+
 def build_agent():
     """
     Builds and returns the LangGraph ReAct agent.
-    Call this once and reuse the returned agent.
+    Call this once at startup and reuse the returned agent object.
     """
     groq_api_key = os.getenv("GROQ_API_KEY")
     if not groq_api_key:
@@ -226,19 +237,12 @@ def build_agent():
         churn_summary_stats,
     ]
 
-    system_prompt = (
-        "You are ChurnIQ, a SaaS revenue intelligence analyst. "
-        "You have access to a trained XGBoost churn prediction model and live customer data. "
-        "Always use your tools to ground answers in real data before responding. "
-        "Be specific, concise, and actionable. "
-        "When citing churn probabilities, express them as percentages. "
-        "Never guess — if you need data, call the appropriate tool."
-    )
-
+    # langgraph 1.x: pass system prompt as a SystemMessage via state_modifier.
+    # If your version uses 'prompt=' instead, swap the argument name below.
     agent = create_react_agent(
         model=llm,
         tools=tools,
-        prompt=system_prompt,
+        state_modifier=SystemMessage(content=_SYSTEM_PROMPT),
     )
 
     return agent
@@ -247,10 +251,9 @@ def build_agent():
 def run_agent(agent, user_message: str) -> str:
     """
     Runs the agent with a user message and returns the final text response.
-    Use this in FastAPI and Streamlit instead of calling the agent directly.
+    Safe to call from FastAPI and Streamlit.
     """
     result = agent.invoke({"messages": [("human", user_message)]})
-    # LangGraph returns a dict with 'messages'; last message is the AI response
     messages = result.get("messages", [])
     if messages:
         return messages[-1].content
@@ -263,7 +266,7 @@ def run_agent(agent, user_message: str) -> str:
 if __name__ == "__main__":
     print("Building ChurnIQ agent...")
     agent = build_agent()
-    print("Agent ready. Type 'quit' to exit.\n")
+    print("Agent ready.\n")
 
     test_questions = [
         "Give me a summary of overall churn stats.",

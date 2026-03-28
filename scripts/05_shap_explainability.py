@@ -1,9 +1,9 @@
 import pandas as pd
 import numpy as np
-import shap
+import shap 
 import joblib
 import json
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt 
 
 # ── Load model and data ───────────────────────────────────────────────────────
 model = joblib.load('models/churn_model.joblib')
